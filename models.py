@@ -109,14 +109,32 @@ class DiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        
+        """_summary_
+        来自 ViT 的 Mlp
+        """
+        self.mlp = Mlp(in_features=hidden_size, 
+                       hidden_features=mlp_hidden_dim, 
+                       act_layer=approx_gelu, 
+                       drop=0)
+        
         self.adaLN_modulation = nn.Sequential(
+            # Swish， x * sigmoid(x)
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        # 将条件 c 经过 SiLU 和 Linear 映射成 6 倍的输入长度，再分割成 6 个 chunk
+        shift_msa, scale_msa, gate_msa, \
+            shift_mlp, scale_mlp, gate_mlp \
+                = self.adaLN_modulation(c).chunk(6, dim=1)
+        
+        # 1. 将 input tokens 进行 LayerNorm，
+        # 2. 再和上面条件 c 产生的 shift, scale 进行调制
+        # 3. 输入 attention，计算自注意力 / MLP
+        # 4. 再和上面的 gate 相乘
+        # 最后加到输入上
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
@@ -173,9 +191,16 @@ class DiT(nn.Module):
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
+        """_summary_
+        堆叠一堆 Transformer 层
+        """
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
+        
+        """_summary_
+        最后一层解码输噪声预测和协方差预测
+        """
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -183,8 +208,11 @@ class DiT(nn.Module):
         # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
+                # 使用 Xavier 均匀分布对线性层的权重进行初始化
+                # 这种初始化方法有助于在训练过程中保持梯度的稳定性，避免梯度消失或梯度爆炸问题
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
+                    # 将线性层的偏置初始化为 0
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
@@ -237,13 +265,21 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        
+        # PatchEmbedding，将输入图像分割成多个小的 patches，并将这些图像块线性投影到一个特定的隐藏维度空间中
+        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / (patch_size ** 2)
+        # 时间步 Embedding
         t = self.t_embedder(t)                   # (N, D)
+        # 标签条件 Embedding
         y = self.y_embedder(y, self.training)    # (N, D)
+        # 最终标签 
         c = t + y                                # (N, D)
+        # 骨干网络
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
+        # 最后一层
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
+        # 还原图像
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
